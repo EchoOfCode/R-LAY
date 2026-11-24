@@ -74,6 +74,13 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    if parent.is_null() && width > 200 && height > 200 {
+        if let Some(hwnd) = spawn_pumped_window_w(
+            ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
+        ) {
+            return hwnd;
+        }
+    }
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -86,6 +93,146 @@ pub extern "system" fn CreateWindowExW(
     }
     hook(hwnd);
     hwnd
+}
+
+fn spawn_pumped_window_w(
+    ex_style: u32,
+    class: PCWSTR,
+    name: PCWSTR,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    parent: HWND,
+    menu: HMENU,
+    instance: HINSTANCE,
+    param: *const c_void,
+) -> Option<HWND> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let class_atom = (class as usize) < 0x10000;
+    let class_atom_val = class as usize;
+    let class_str: Option<Vec<u16>> = if !class_atom && !class.is_null() {
+        let mut len = 0;
+        unsafe {
+            while *class.add(len) != 0 {
+                len += 1;
+            }
+            Some(std::slice::from_raw_parts(class, len + 1).to_vec())
+        }
+    } else {
+        None
+    };
+    let name_str: Option<Vec<u16>> = if !name.is_null() {
+        let mut len = 0;
+        unsafe {
+            while *name.add(len) != 0 {
+                len += 1;
+            }
+            Some(std::slice::from_raw_parts(name, len + 1).to_vec())
+        }
+    } else {
+        None
+    };
+    let param_addr = param as usize;
+    let parent_addr = parent as usize;
+    let menu_addr = menu as usize;
+    let instance_addr = instance as usize;
+    let thread = std::thread::Builder::new()
+        .name("victory-ui-pump".into())
+        .spawn(move || {
+            unsafe {
+                wm::DisableProcessWindowsGhosting();
+                let class_ptr = if let Some(ref s) = class_str {
+                    s.as_ptr()
+                } else {
+                    class_atom_val as PCWSTR
+                };
+                let name_ptr = if let Some(ref s) = name_str {
+                    s.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let parent = parent_addr as HWND;
+                let menu = menu_addr as HMENU;
+                let instance = instance_addr as HINSTANCE;
+                let mut hwnd = wm::CreateWindowExW(
+                    ex_style,
+                    class_ptr,
+                    name_ptr,
+                    style | wm::WS_VISIBLE,
+                    x,
+                    y,
+                    width,
+                    height,
+                    parent,
+                    menu,
+                    instance,
+                    param_addr as *const c_void,
+                );
+                if hwnd.is_null() {
+                    let err = windows_sys::Win32::Foundation::GetLastError();
+                    tracing::warn!(err, "CreateWindowExW with title class returned null; trying custom window class");
+                    const FALLBACK_CLASS: PCWSTR = w!("VIctoryRenderWindowClass");
+                    let wc = wm::WNDCLASSEXW {
+                        cbSize: std::mem::size_of::<wm::WNDCLASSEXW>() as u32,
+                        style: wm::CS_HREDRAW | wm::CS_VREDRAW,
+                        lpfnWndProc: Some(window_proc),
+                        cbClsExtra: 0,
+                        cbWndExtra: 0,
+                        hInstance: instance,
+                        hIcon: std::ptr::null_mut(),
+                        hCursor: wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW),
+                        hbrBackground: std::ptr::null_mut(),
+                        lpszMenuName: std::ptr::null(),
+                        lpszClassName: FALLBACK_CLASS,
+                        hIconSm: std::ptr::null_mut(),
+                    };
+                    wm::RegisterClassExW(&wc);
+                    hwnd = wm::CreateWindowExW(
+                        ex_style,
+                        FALLBACK_CLASS,
+                        name_ptr,
+                        style | wm::WS_VISIBLE,
+                        x,
+                        y,
+                        width,
+                        height,
+                        parent,
+                        menu,
+                        instance,
+                        param_addr as *const c_void,
+                    );
+                }
+                if !hwnd.is_null() {
+                    tracing::info!(hwnd = format_args!("0x{:x}", hwnd as usize), "title render window created on UI pump thread");
+                    hook(hwnd);
+                    victory_gpu::register_title_window(hwnd as usize);
+                    let _ = wm::ShowWindow(hwnd, wm::SW_SHOWNORMAL);
+                    let _ = wm::SetForegroundWindow(hwnd);
+                    let _ = wm::BringWindowToTop(hwnd);
+                    let _ = windows_sys::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+                } else {
+                    let err = windows_sys::Win32::Foundation::GetLastError();
+                    tracing::error!(err, "failed to create title window on UI pump thread");
+                }
+                let _ = sender.send(hwnd as usize);
+                if hwnd.is_null() {
+                    return;
+                }
+                let mut msg = wm::MSG::default();
+                while wm::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                    let _ = wm::TranslateMessage(&msg);
+                    wm::DispatchMessageW(&msg);
+                }
+            }
+        });
+    if thread.is_ok() && let Ok(hwnd) = receiver.recv() {
+        if hwnd != 0 {
+            return Some(hwnd as HWND);
+        }
+    }
+    None
 }
 
 /// See [`CreateWindowExW`].
@@ -104,6 +251,13 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    if parent.is_null() && width > 200 && height > 200 {
+        if let Some(hwnd) = spawn_pumped_window_a(
+            ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
+        ) {
+            return hwnd;
+        }
+    }
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -116,6 +270,146 @@ pub extern "system" fn CreateWindowExA(
     }
     hook(hwnd);
     hwnd
+}
+
+fn spawn_pumped_window_a(
+    ex_style: u32,
+    class: PCSTR,
+    name: PCSTR,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    parent: HWND,
+    menu: HMENU,
+    instance: HINSTANCE,
+    param: *const c_void,
+) -> Option<HWND> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let class_atom = (class as usize) < 0x10000;
+    let class_atom_val = class as usize;
+    let class_str: Option<Vec<u8>> = if !class_atom && !class.is_null() {
+        let mut len = 0;
+        unsafe {
+            while *class.add(len) != 0 {
+                len += 1;
+            }
+            Some(std::slice::from_raw_parts(class, len + 1).to_vec())
+        }
+    } else {
+        None
+    };
+    let name_str: Option<Vec<u8>> = if !name.is_null() {
+        let mut len = 0;
+        unsafe {
+            while *name.add(len) != 0 {
+                len += 1;
+            }
+            Some(std::slice::from_raw_parts(name, len + 1).to_vec())
+        }
+    } else {
+        None
+    };
+    let param_addr = param as usize;
+    let parent_addr = parent as usize;
+    let menu_addr = menu as usize;
+    let instance_addr = instance as usize;
+    let thread = std::thread::Builder::new()
+        .name("victory-ui-pump-a".into())
+        .spawn(move || {
+            unsafe {
+                wm::DisableProcessWindowsGhosting();
+                let class_ptr = if let Some(ref s) = class_str {
+                    s.as_ptr()
+                } else {
+                    class_atom_val as PCSTR
+                };
+                let name_ptr = if let Some(ref s) = name_str {
+                    s.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let parent = parent_addr as HWND;
+                let menu = menu_addr as HMENU;
+                let instance = instance_addr as HINSTANCE;
+                let mut hwnd = wm::CreateWindowExA(
+                    ex_style,
+                    class_ptr,
+                    name_ptr,
+                    style | wm::WS_VISIBLE,
+                    x,
+                    y,
+                    width,
+                    height,
+                    parent,
+                    menu,
+                    instance,
+                    param_addr as *const c_void,
+                );
+                if hwnd.is_null() {
+                    let err = windows_sys::Win32::Foundation::GetLastError();
+                    tracing::warn!(err, "CreateWindowExA with title class returned null; trying custom window class");
+                    const FALLBACK_CLASS_A: *const u8 = b"VIctoryRenderWindowClassA\0".as_ptr();
+                    let wc = wm::WNDCLASSEXA {
+                        cbSize: std::mem::size_of::<wm::WNDCLASSEXA>() as u32,
+                        style: wm::CS_HREDRAW | wm::CS_VREDRAW,
+                        lpfnWndProc: Some(window_proc),
+                        cbClsExtra: 0,
+                        cbWndExtra: 0,
+                        hInstance: instance,
+                        hIcon: std::ptr::null_mut(),
+                        hCursor: wm::LoadCursorA(std::ptr::null_mut(), wm::IDC_ARROW as usize as PCSTR),
+                        hbrBackground: std::ptr::null_mut(),
+                        lpszMenuName: std::ptr::null(),
+                        lpszClassName: FALLBACK_CLASS_A,
+                        hIconSm: std::ptr::null_mut(),
+                    };
+                    wm::RegisterClassExA(&wc);
+                    hwnd = wm::CreateWindowExA(
+                        ex_style,
+                        FALLBACK_CLASS_A,
+                        name_ptr,
+                        style | wm::WS_VISIBLE,
+                        x,
+                        y,
+                        width,
+                        height,
+                        parent,
+                        menu,
+                        instance,
+                        param_addr as *const c_void,
+                    );
+                }
+                if !hwnd.is_null() {
+                    tracing::info!(hwnd = format_args!("0x{:x}", hwnd as usize), "title render window created on UI pump thread (ANSI)");
+                    hook(hwnd);
+                    victory_gpu::register_title_window(hwnd as usize);
+                    let _ = wm::ShowWindow(hwnd, wm::SW_SHOWNORMAL);
+                    let _ = wm::SetForegroundWindow(hwnd);
+                    let _ = wm::BringWindowToTop(hwnd);
+                    let _ = windows_sys::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+                } else {
+                    let err = windows_sys::Win32::Foundation::GetLastError();
+                    tracing::error!(err, "failed to create title window on UI pump thread (ANSI)");
+                }
+                let _ = sender.send(hwnd as usize);
+                if hwnd.is_null() {
+                    return;
+                }
+                let mut msg = wm::MSG::default();
+                while wm::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                    let _ = wm::TranslateMessage(&msg);
+                    wm::DispatchMessageW(&msg);
+                }
+            }
+        });
+    if thread.is_ok() && let Ok(hwnd) = receiver.recv() {
+        if hwnd != 0 {
+            return Some(hwnd as HWND);
+        }
+    }
+    None
 }
 
 /// A console title sizes its window to its render target (Grand Theft
@@ -182,6 +476,27 @@ extern "system" fn window_proc(
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
+    if message == wm::WM_ERASEBKGND {
+        // Prevent Windows / DefWindowProc from erasing the DXGI flip model swapchain with the class background brush (solid black).
+        return 1;
+    }
+    if message == wm::WM_PAINT {
+        // Validate the update region so Windows stops spamming WM_PAINT and DWM does not compose a black dirty region.
+        unsafe {
+            use windows_sys::Win32::Graphics::Gdi as gdi;
+            let mut ps: gdi::PAINTSTRUCT = std::mem::zeroed();
+            let hdc = gdi::BeginPaint(hwnd, &mut ps);
+            if !hdc.is_null() {
+                gdi::EndPaint(hwnd, &ps);
+            }
+            gdi::ValidateRect(hwnd, std::ptr::null());
+        }
+        return 0;
+    }
+    if message == wm::WM_DESTROY {
+        unsafe { wm::PostQuitMessage(0) };
+        return 0;
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
@@ -189,7 +504,11 @@ extern "system" fn window_proc(
             wm::RemovePropW(hwnd, TITLE_PROC);
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
-        wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+        if let Some(proc) = title {
+            wm::CallWindowProcW(Some(proc), hwnd, message, wparam, lparam)
+        } else {
+            wm::DefWindowProcW(hwnd, message, wparam, lparam)
+        }
     }
 }
 

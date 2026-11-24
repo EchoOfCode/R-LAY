@@ -1873,6 +1873,25 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_ERASEBKGND {
+        return LRESULT(1);
+    }
+    if message == WM_PAINT {
+        unsafe {
+            use windows::Win32::Graphics::Gdi::*;
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if !hdc.is_invalid() {
+                let _ = EndPaint(hwnd, &ps);
+            }
+            let _ = ValidateRect(Some(hwnd), None);
+        }
+        return LRESULT(0);
+    }
+    if message == WM_DESTROY {
+        unsafe { PostQuitMessage(0) };
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
