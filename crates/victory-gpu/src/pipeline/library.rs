@@ -82,6 +82,10 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
+    let mut buffer = Vec::new();
+    // Pre-allocate 16 MiB serialization buffer early so we avoid heap allocation
+    // and fragmentation during peak shader compilation.
+    let _ = buffer.try_reserve(16 * 1024 * 1024);
     if !blob.is_empty() {
         match make(&blob) {
             Ok(library) => {
@@ -90,7 +94,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
                     library,
                     _blob: blob,
                     added: 0,
-                    buffer: Vec::new(),
+                    buffer,
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -103,7 +107,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         library,
         _blob: Vec::new(),
         added: 0,
-        buffer: Vec::new(),
+        buffer,
     })
 }
 
@@ -167,13 +171,18 @@ pub(crate) fn save(now: bool) {
     if size == 0 {
         return;
     }
-    if l.buffer.len() < size {
-        let additional = size - l.buffer.len();
-        if l.buffer.try_reserve_exact(additional).is_err() {
+    if l.buffer.capacity() < size {
+        let additional = size.saturating_sub(l.buffer.capacity());
+        // Reserve with amortized headroom so we don't reallocate repeatedly.
+        if l.buffer.try_reserve(additional.max(4 * 1024 * 1024)).is_err() {
             tracing::warn!(size, "insufficient memory to serialize host pipeline library; skipping save");
             return;
         }
-        l.buffer.resize(size, 0);
+    }
+    // SAFETY: buffer capacity is at least `size` bytes. We set the length so that
+    // &mut buffer[..size] is valid for Serialize without zeroing overhead.
+    unsafe {
+        l.buffer.set_len(size);
     }
     let Library {
         library,

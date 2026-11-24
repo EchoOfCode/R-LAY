@@ -194,6 +194,13 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
+            if last.read.capacity() < size {
+                let add = size.saturating_sub(last.read.capacity());
+                if last.read.try_reserve(add).is_err() {
+                    tracing::warn!(size, "insufficient memory to read watched texture; skipping");
+                    return 0;
+                }
+            }
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
             self.detile(&last.read);

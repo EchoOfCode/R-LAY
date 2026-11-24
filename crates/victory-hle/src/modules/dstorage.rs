@@ -903,7 +903,12 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
     }
-    let mut bytes = vec![0; size];
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(size).is_err() {
+        tracing::warn!(size, "DirectStorage: insufficient memory for source buffer");
+        return Err(windows_sys::Win32::Foundation::E_OUTOFMEMORY);
+    }
+    bytes.resize(size, 0);
     read_into(request, &mut bytes)?;
     Ok(Cow::Owned(bytes))
 }
