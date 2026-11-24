@@ -611,9 +611,9 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`) or isolated (`dred_on`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() || dred_on() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -640,6 +640,18 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            self.log_messages();
+            // SAFETY: a plain query.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                fail(format_args!(
+                    "host GPU device removed after executing list {} of {} (submission of {} lists){}{}",
+                    i + 1,
+                    groups.len(),
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(&runs[i.min(runs.len().saturating_sub(1))..])
+                ));
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
