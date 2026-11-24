@@ -32,6 +32,10 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>)>,
 }
 
+// A deferred slot already contains a typed null descriptor. Generation zero
+// is reserved, so this cannot collide with a materialized view's key.
+const DEFERRED_VIEW: u64 = 1;
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -341,7 +345,7 @@ impl HostHeap {
         };
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
+            made[index as usize] = if later { DEFERRED_VIEW } else { key };
             let kept = if later {
                 None
             } else {
@@ -363,6 +367,9 @@ impl HostHeap {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         if key == 0 {
             return Some("null".into());
+        }
+        if key == DEFERRED_VIEW {
+            return Some("deferred typed null".into());
         }
         let view = view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
@@ -576,22 +583,32 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     let typeless = family(own) == own && family(own + 1) == own;
     if let Some(format) = format.as_deref_mut()
         && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
+    {
+        if matches!(format.0, 85 | 86 | 88 | 89) {
+            format.0 = 87;
+        }
+        if let Some(&(_, linear)) = crate::resource::SRGB
             .iter()
             .find(|&&(s, _)| s == format.0 as u32)
-    {
-        format.0 = linear as i32;
+        {
+            format.0 = linear as i32;
+        }
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
         return !typeless;
     }
-    if family(view) != family(own) {
+    let (fv, fo) = (family(view), family(own));
+    let compatible = fv == fo
+        || (matches!(fv, 90 | 92) && matches!(fo, 90 | 92))
+        || (fv == 115 && matches!(fo, 87 | 90 | 92))
+        || (fv == 67 && fo == 26);
+    if !compatible {
         once!(view, own, "view format of another family");
         return false;
     }
     if let Some(format) = format
-        && !typeless
+        && (!typeless || fv == 115 || fv == 67)
     {
         *format = d.Format;
     }
@@ -729,14 +746,14 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
-/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
+/// cannot make: unordered access or a shader
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    let buffer = match view {
-        View::Unordered(r, _, _) => is_buffer(r),
-        View::Placed(true, resource, _) => resource[0] == 1,
+    let (buffer, dimension) = match view {
+        View::Unordered(r, _, desc) => (is_buffer(r), desc.as_ref().map(|d| d[1])),
+        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
@@ -756,7 +773,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
-    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
         ViewDimension: if buffer {
             D3D12_UAV_DIMENSION_BUFFER
@@ -765,6 +782,26 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         },
         ..Default::default()
     };
+    if !buffer {
+        match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+            Some(dim @ (D3D12_UAV_DIMENSION_TEXTURE1D | D3D12_UAV_DIMENSION_TEXTURE2D)) => {
+                desc.ViewDimension = dim;
+            }
+            Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { ArraySize: 1, ..Default::default() };
+            }
+            Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: 1, ..Default::default() };
+            }
+            Some(D3D12_UAV_DIMENSION_TEXTURE3D) => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                desc.Anonymous.Texture3D = D3D12_TEX3D_UAV { WSize: 1, ..Default::default() };
+            }
+            _ => {}
+        }
+    }
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device.CreateUnorderedAccessView(

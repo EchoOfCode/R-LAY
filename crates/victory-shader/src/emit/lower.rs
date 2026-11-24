@@ -3606,6 +3606,19 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 int(self, r)
             }
+            "v_swap_b32" => {
+                let (Some(Operand::Vector { reg: dst, .. }), Some(&Operand::Vector { reg: src, .. })) =
+                    (v.dst, v.src.first())
+                else {
+                    return Err("swap requires two vector registers");
+                };
+                let old_dst = self.i32_of(inst.read(Reg::V(dst)).ok_or("swap destination")?)?;
+                let old_src = s(self, 0)?;
+                if src != dst {
+                    self.write_placed(inst, Reg::V(src), old_dst, guard);
+                }
+                int(self, old_src)
+            }
             "v_mov_b32" => {
                 if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
                     let a = f(self, 0)?;

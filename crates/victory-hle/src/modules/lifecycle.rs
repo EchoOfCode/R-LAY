@@ -80,6 +80,10 @@ pub extern "system" fn CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    if parent.is_null() && width > 200 && height > 200 {
+        #[cfg(windows)]
+        victory_gpu::register_title_window(hwnd as usize);
+    }
     hook(hwnd);
     hwnd
 }
@@ -106,6 +110,10 @@ pub extern "system" fn CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    if parent.is_null() && width > 200 && height > 200 {
+        #[cfg(windows)]
+        victory_gpu::register_title_window(hwnd as usize);
+    }
     hook(hwnd);
     hwnd
 }

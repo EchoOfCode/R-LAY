@@ -43,7 +43,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        cost = min(g.x * g.y * g.z, 1u << 20) * 64;
+        // Limit the actual dispatch, including when its original product exceeds 32 bits.
+        if (all(g != 0)) {
+            g.y = min(g.y, (1u << 20) / g.x);
+            g.z = min(g.z, (1u << 20) / (g.x * g.y));
+        }
+        cost = g.x * g.y * g.z * 64u;
         args.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
@@ -52,11 +57,17 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+    // Rejected work must not increment the counter and roll it back to zero.
+    uint before = budget.Load(0);
+    [allow_uav_condition] while (cost != 0) {
+        if (before > BUDGET || cost > BUDGET - before) {
+            args.Store(at, 0);
+            break;
+        }
+        uint observed;
+        budget.InterlockedCompareExchange(0, before, before + cost, observed);
+        if (observed == before) break;
+        before = observed;
     }
 }
 "#;

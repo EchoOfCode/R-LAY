@@ -239,7 +239,7 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
-    const FAMILIES: [(u32, u32); 22] = [
+    const FAMILIES: [(u32, u32); 23] = [
         (1, 4),
         (5, 8),
         (9, 14),
@@ -258,6 +258,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (76, 78),
         (79, 81),
         (82, 84),
+        (85, 86),
         (90, 91),
         (92, 93),
         (94, 96),
@@ -834,14 +835,42 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // Formats that do not support UAV on PC D3D12:
+    // Format 67 (R9G9B9E5_SHAREDEXP) and 16-bit packed formats 85 (B5G6R5_UNORM) / 86 (B5G5R5A1_UNORM) have no UAV support.
+    if d.flags & UNORDERED != 0 && matches!(d.format, 67 | 85 | 86) {
+        d.flags &= !UNORDERED;
+    }
+    // D3D12 does not support UAV on B8G8R8X8 (format 88/92/93).
+    // Map to B8G8R8A8_TYPELESS (format 90), which has identical 32-bit layout and supports UAV.
+    if d.flags & UNORDERED != 0 && matches!(d.format, 88 | 92 | 93) {
+        d.format = 90;
+    }
+    // Format 67 (R9G9B9E5_SHAREDEXP) is not supported as a render target or UAV on PC D3D12.
+    // Map to R11G11B10_FLOAT (format 26), which is the standard 32-bit HDR float render target format.
+    const RENDER_TARGET: u32 = 1;
+    if d.format == 67 && (d.flags & RENDER_TARGET != 0 || d.flags & UNORDERED != 0) {
+        d.format = 26;
+    }
+    // Format 115 (B4G4R4A4_UNORM) is not supported as a render target on PC D3D12.
+    // Map to B8G8R8A8_UNORM (format 87) if render target is set.
+    if d.format == 115 && d.flags & RENDER_TARGET != 0 {
+        d.format = 87;
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let mut clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
         value
     });
+    if let Some(ref mut cv) = clear_value {
+        if cv[0] == 67 && d.format == 26 {
+            cv[0] = 26;
+        } else if family(cv[0]) != family(d.format) {
+            clear_value = None;
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -849,7 +878,7 @@ fn host_texture(
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
-    let made = unsafe {
+    let mut made = unsafe {
         host.device.CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
@@ -862,6 +891,42 @@ fn host_texture(
             &mut texture,
         )
     };
+    if made.is_err() && clear_value.is_some() {
+        made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                ),
+                None,
+                &mut texture,
+            )
+        };
+        if made.is_ok() {
+            tracing::info!(desc = ?d, "created host texture without clear value fallback");
+        }
+    }
+    if made.is_err() && (d.flags & UNORDERED != 0 || d.flags & DEPTH != 0) {
+        let mut fallback_d = d;
+        fallback_d.flags &= !(UNORDERED | DEPTH);
+        made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const fallback_d).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(fallback_d.flags, crate::host::texture_state(state)) as i32,
+                ),
+                None,
+                &mut texture,
+            )
+        };
+        if made.is_ok() {
+            tracing::info!(desc = ?d, "created host texture with relaxed flags fallback");
+        }
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }

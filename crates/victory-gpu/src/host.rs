@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -53,6 +53,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    pub(crate) dummy_views: ID3D12DescriptorHeap,
+    pub(crate) dummy_samplers: ID3D12DescriptorHeap,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -104,13 +106,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
-            ),
             None => {}
         }
     }
     tracing::error!("{text}");
+    eprintln!("\nVIctory Error: {text}\n");
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -131,12 +131,60 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+fn select_adapter(factory: &IDXGIFactory4) -> Option<IDXGIAdapter> {
+    let mut chosen: Option<(IDXGIAdapter1, usize, String)> = None;
+    let target = std::env::var("VICTORY_GPU_ADAPTER").ok();
+    let mut i = 0;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(i) } {
+        i += 1;
+        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+            let name = String::from_utf16_lossy(&desc.Description)
+                .trim_matches('\0')
+                .trim()
+                .to_string();
+            let is_software = (desc.Flags & (DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32)) != 0;
+            let vram_mb = desc.DedicatedVideoMemory / (1024 * 1024);
+            tracing::info!(
+                index = i - 1,
+                name = %name,
+                dedicated_vram_mb = vram_mb,
+                shared_ram_mb = desc.SharedSystemMemory / (1024 * 1024),
+                is_software,
+                "found DXGI adapter"
+            );
+            if let Some(ref t) = target {
+                if t.trim() == (i - 1).to_string() || name.to_lowercase().contains(&t.to_lowercase()) {
+                    tracing::info!(index = i - 1, name = %name, "adapter matched VICTORY_GPU_ADAPTER filter");
+                    return adapter.cast::<IDXGIAdapter>().ok();
+                }
+            }
+            if !is_software {
+                if let Some((_, best_vram, _)) = &chosen {
+                    if desc.DedicatedVideoMemory > *best_vram {
+                        chosen = Some((adapter, desc.DedicatedVideoMemory, name));
+                    }
+                } else {
+                    chosen = Some((adapter, desc.DedicatedVideoMemory, name));
+                }
+            }
+        }
+    }
+    if let Some((adapter, vram, name)) = chosen {
+        tracing::info!(
+            name = %name,
+            dedicated_vram_mb = vram / (1024 * 1024),
+            "selected high-performance host GPU adapter"
+        );
+        adapter.cast::<IDXGIAdapter>().ok()
+    } else {
+        None
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
-        // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        let debug = std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|v| v != "0");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -182,12 +230,15 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let adapter = select_adapter(&factory);
+            match &adapter {
+                Some(a) => D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
-        let messages = debug
-            .then(|| device.cast::<ID3D12InfoQueue>().ok())
-            .flatten();
+        let messages = device.cast::<ID3D12InfoQueue>().ok();
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
@@ -208,6 +259,52 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+
+        let dummy_views: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })?;
+        let dummy_srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        device.CreateShaderResourceView(
+            None::<&ID3D12Resource>,
+            Some(&dummy_srv_desc),
+            dummy_views.GetCPUDescriptorHandleForHeapStart(),
+        );
+
+        let dummy_samplers: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })?;
+        let dummy_sampler_desc = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            ..Default::default()
+        };
+        device.CreateSampler(
+            &dummy_sampler_desc,
+            dummy_samplers.GetCPUDescriptorHandleForHeapStart(),
+        );
+
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -223,6 +320,8 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            dummy_views,
+            dummy_samplers,
         })
     }
 }
@@ -270,7 +369,8 @@ type States = std::collections::HashMap<
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v != "0")
+            || std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|v| v != "0")
     })
 }
 
@@ -459,6 +559,7 @@ impl Host {
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
+        self.log_messages();
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
@@ -630,6 +731,9 @@ impl Host {
                     let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                        eprintln!("D3D12: {text}");
+                    }
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
                     if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
                         first_error = Some(text.to_owned());
@@ -1210,7 +1314,7 @@ impl Host {
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        85..=93 => DXGI_FORMAT_B8G8R8A8_UNORM,
         23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
         9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         _ => return None,
@@ -1335,6 +1439,10 @@ impl Host {
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
+        static PRESENT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if PRESENT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+            tracing::info!(width = desc.Width, height = desc.Height, format = desc.Format.0, "present called with texture");
+        }
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
@@ -1365,7 +1473,8 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
+        let legal = legal_state(texture, state);
+        let state = D3D12_RESOURCE_STATES(legal as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -1374,14 +1483,16 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            let mut before_barriers = Vec::with_capacity(2);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                before_barriers.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            }
+            before_barriers.push(transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ));
+            list.ResourceBarrier(&before_barriers);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -1391,21 +1502,26 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let mut after_barriers = Vec::with_capacity(2);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                after_barriers.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+            }
+            after_barriers.push(transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            ));
+            list.ResourceBarrier(&after_barriers);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let present_res = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if let Err(ref e) = present_res.ok() {
+                tracing::error!(error = %e, "swap_chain.Present returned ERROR");
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -1437,7 +1553,9 @@ impl Host {
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
+                Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                AlphaMode: DXGI_ALPHA_MODE_IGNORE,
                 ..Default::default()
             };
             let swap_chain = factory
@@ -1445,7 +1563,17 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                hwnd = ?hwnd.0,
+                client_width = rect.right - rect.left,
+                client_height = rect.bottom - rect.top,
+                "presenting to a window"
+            );
             Ok(Presenter {
                 swap_chain,
                 width,
@@ -1459,27 +1587,100 @@ impl Host {
     }
 }
 
+static TITLE_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers the title's main window handle.
+pub fn register_title_window(hwnd: usize) {
+    if hwnd != 0 {
+        tracing::info!(hwnd = format_args!("0x{:x}", hwnd), "registered main title window");
+        TITLE_HWND.store(hwnd, Ordering::SeqCst);
+    }
+}
+
 /// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// it made one. Chooses the real main render window by selecting the registered
+/// title window or the one with the largest client area.
 fn title_window() -> Option<HWND> {
-    extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+    let reg = TITLE_HWND.load(Ordering::SeqCst);
+    if reg != 0 {
+        let hwnd = HWND(reg as *mut _);
+        if unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            let mut rect = RECT::default();
+            let _ = unsafe { GetClientRect(hwnd, &mut rect) };
+            tracing::info!(
+                hwnd = format_args!("0x{:x}", reg),
+                client_width = rect.right - rect.left,
+                client_height = rect.bottom - rect.top,
+                "using registered title window"
+            );
+            return Some(hwnd);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        hwnd: HWND,
+        area: i64,
+        w: i32,
+        h: i32,
+        visible: bool,
+    }
+    extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
-        // SAFETY: a window handle from the enumeration; `found` is ours.
+        // SAFETY: a window handle from the enumeration; `lparam` points to our Vec.
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut process));
-            if process == windows::Win32::System::Threading::GetCurrentProcessId()
-                && IsWindowVisible(hwnd).as_bool()
-            {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
+            if process == windows::Win32::System::Threading::GetCurrentProcessId() {
+                let mut rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rect);
+                let w = rect.right - rect.left;
+                let h = rect.bottom - rect.top;
+                let area = (w as i64) * (h as i64);
+                let visible = IsWindowVisible(hwnd).as_bool();
+                let candidates = &mut *(lparam.0 as *mut Vec<Candidate>);
+                candidates.push(Candidate {
+                    hwnd,
+                    area,
+                    w,
+                    h,
+                    visible,
+                });
             }
         }
         true.into()
     }
-    let mut found: Option<HWND> = None;
-    // SAFETY: the callback only writes `found`, which outlives the call.
-    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
-    found
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut candidates as isize)) };
+    for c in &candidates {
+        tracing::info!(
+            hwnd = ?c.hwnd.0,
+            width = c.w,
+            height = c.h,
+            area = c.area,
+            visible = c.visible,
+            "window candidate"
+        );
+    }
+    let chosen = candidates
+        .iter()
+        .filter(|c| c.w >= 320 && c.h >= 240)
+        .max_by_key(|c| (c.visible, c.area))
+        .or_else(|| candidates.iter().filter(|c| c.visible).max_by_key(|c| c.area))
+        .or_else(|| candidates.iter().max_by_key(|c| c.area))
+        .copied();
+
+    if let Some(c) = chosen {
+        tracing::info!(
+            hwnd = ?c.hwnd.0,
+            width = c.w,
+            height = c.h,
+            visible = c.visible,
+            "selected title window for swap chain"
+        );
+        Some(c.hwnd)
+    } else {
+        None
+    }
 }
 
 /// `state` without the bits the host texture's flags forbid: the console

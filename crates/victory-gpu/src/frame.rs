@@ -53,7 +53,27 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let requested = interval;
+    let unlocked = std::env::var("VICTORY_UNLOCKED_FPS").as_deref() == Ok("1")
+        || std::env::var("VICTORY_FPS").as_deref() == Ok("0");
+    let interval = if unlocked {
+        SIXTIETH
+    } else if let Ok(fps) = std::env::var("VICTORY_FPS") {
+        match fps.trim().parse::<u64>() {
+            Ok(0) => SIXTIETH,
+            Ok(fps) => Duration::from_micros(1_000_000 / fps.max(1)),
+            Err(_) => requested,
+        }
+    } else if std::env::var("VICTORY_MENU_60").as_deref() == Ok("1") {
+        if (33_332..=33_334).contains(&requested.as_micros()) {
+            SIXTIETH
+        } else {
+            requested
+        }
+    } else {
+        requested
+    };
+    tracing::info!(?requested, ?interval, unlocked, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -128,7 +148,12 @@ pub(crate) extern "system" fn wait(
     let origin = kind == ORIGIN;
     let (tick, wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
-    let hr = if wait > limit {
+    let unlocked = std::env::var("VICTORY_UNLOCKED_FPS").as_deref() == Ok("1")
+        || std::env::var("VICTORY_FPS").as_deref() == Ok("0");
+    let hr = if unlocked {
+        last(kind).fetch_max(tick, Ordering::Relaxed);
+        S_OK
+    } else if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
     } else {

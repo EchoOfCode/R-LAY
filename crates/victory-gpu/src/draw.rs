@@ -52,7 +52,6 @@ pub(crate) struct IndexView {
 }
 
 /// What one title list has set, and what its host list was last given.
-#[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
     /// View heap, sampler heap.
@@ -77,6 +76,27 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            pipeline: 0,
+            heaps: [0; 2],
+            graphics: Vec::new(),
+            compute: Vec::new(),
+            vertex: [VertexView { address: 0, size: 0, stride: 0 }; 32],
+            index: IndexView { address: 0, size: 0, format: 0 },
+            targets: Vec::new(),
+            depth: 0,
+            topology: 0,
+            host_pipeline: usize::MAX,
+            host_roots: [usize::MAX; 2],
+            host_heaps: [usize::MAX; 2],
+            fresh_tables: std::collections::HashMap::new(),
+            dynamic: Vec::new(),
+        }
+    }
 }
 
 impl Drop for State {
@@ -401,19 +421,44 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+        // set after them. D3D12 requires that if directly indexed flags are
+        // set on the root signature, corresponding shader-visible heaps must
+        // be set on the list, even if empty or compute-only.
+        let host = crate::host::host();
+        let view_host = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten();
+        let sampler_host = (self.heaps[1] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[1] as This).host())
+            .flatten();
+
+        let view_heap = view_host
+            .map(|h| h.heap.clone())
+            .or_else(|| host.map(|h| h.dummy_views.clone()));
+        let sampler_heap = sampler_host
+            .map(|h| h.heap.clone())
+            .or_else(|| host.map(|h| h.dummy_samplers.clone()));
+
+        let bound_keys = [
+            view_heap.as_ref().map_or(0, |h| h.as_raw() as usize),
+            sampler_heap.as_ref().map_or(0, |h| h.as_raw() as usize),
+        ];
+
+        if self.host_heaps != bound_keys {
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+            if let Some(v) = &view_heap {
+                list.keep(v);
+                heaps.push(Some(v.clone()));
+            }
+            if let Some(s) = &sampler_heap {
+                list.keep(s);
+                heaps.push(Some(s.clone()));
+            }
+            if !heaps.is_empty() {
+                // SAFETY: an open list and shader-visible heaps (at most 1 of each type).
+                unsafe { l.SetDescriptorHeaps(&heaps) };
+            }
+            self.host_heaps = bound_keys;
             self.host_roots = [0; 2];
         }
         let root = p.root.as_raw() as usize;
