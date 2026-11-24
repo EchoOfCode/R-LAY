@@ -97,6 +97,7 @@ impl Default for State {
             host_heaps: [usize::MAX; 2],
             fresh_tables: std::collections::HashMap::new(),
             dynamic: Vec::new(),
+            table_failed: false,
         }
     }
 }

@@ -807,7 +807,6 @@ fn effects(
             }
             match name {
                 "v_swap_b32" => {
-                "v_swap_b32" => {
                     regs(&v.src[0], &mut w)?;
                     if let Some(d) = &v.dst {
                         regs(d, &mut r)?;
