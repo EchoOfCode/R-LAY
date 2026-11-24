@@ -493,11 +493,6 @@ extern "system" fn window_proc(
         // Validate the update region so Windows stops spamming WM_PAINT and DWM does not compose a black dirty region.
         unsafe {
             use windows_sys::Win32::Graphics::Gdi as gdi;
-            let mut ps: gdi::PAINTSTRUCT = std::mem::zeroed();
-            let hdc = gdi::BeginPaint(hwnd, &mut ps);
-            if !hdc.is_null() {
-                gdi::EndPaint(hwnd, &ps);
-            }
             gdi::ValidateRect(hwnd, std::ptr::null());
         }
         return 0;
@@ -513,7 +508,9 @@ extern "system" fn window_proc(
             wm::RemovePropW(hwnd, TITLE_PROC);
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
-        if let Some(proc) = title {
+        if let Some(proc) = title
+            && (proc as usize) != (window_proc as *const () as usize)
+        {
             wm::CallWindowProcW(Some(proc), hwnd, message, wparam, lparam)
         } else {
             wm::DefWindowProcW(hwnd, message, wparam, lparam)

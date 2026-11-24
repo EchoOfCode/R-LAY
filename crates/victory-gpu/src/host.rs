@@ -597,39 +597,23 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`) or isolated (`dred_on`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() || dred_on() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
+        for (i, list) in runs.iter().enumerate() {
             *submitted += 1;
+            let mut sub_lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2);
+            if let Some(prelude) = list.prelude() {
+                sub_lists.push(Some(prelude));
+            }
+            sub_lists.push(list.list.cast().ok());
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                self.queue.ExecuteCommandLists(&sub_lists[..]);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -647,14 +631,14 @@ impl Host {
                 fail(format_args!(
                     "host GPU device removed after executing list {} of {} (submission of {} lists){}{}",
                     i + 1,
-                    groups.len(),
+                    runs.len(),
                     runs.len(),
                     self.removal_data(runs),
                     last_notes(&runs[i.min(runs.len().saturating_sub(1))..])
                 ));
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if runs.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -665,7 +649,6 @@ impl Host {
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
