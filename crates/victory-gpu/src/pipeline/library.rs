@@ -42,6 +42,8 @@ struct Library {
     _blob: Vec<u8>,
     /// Pipelines stored since the last save.
     added: u64,
+    /// Reusable serialization buffer to avoid repeated heap allocation/fragmentation.
+    buffer: Vec<u8>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; every call is made under the
@@ -84,7 +86,12 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         match make(&blob) {
             Ok(library) => {
                 tracing::info!(bytes = blob.len(), "host pipeline library loaded");
-                return Some(Library { library, _blob: blob, added: 0 });
+                return Some(Library {
+                    library,
+                    _blob: blob,
+                    added: 0,
+                    buffer: Vec::new(),
+                });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
         }
@@ -92,7 +99,12 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
     let library = make(&[]).ok()?;
-    Some(Library { library, _blob: Vec::new(), added: 0 })
+    Some(Library {
+        library,
+        _blob: Vec::new(),
+        added: 0,
+        buffer: Vec::new(),
+    })
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -147,34 +159,46 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let blob = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+    if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let size = unsafe { l.library.GetSerializedSize() };
+    if size == 0 {
+        return;
+    }
+    if l.buffer.len() < size {
+        let additional = size - l.buffer.len();
+        if l.buffer.try_reserve_exact(additional).is_err() {
+            tracing::warn!(size, "insufficient memory to serialize host pipeline library; skipping save");
             return;
         }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                bytes
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
-            }
+        l.buffer.resize(size, 0);
+    }
+    let Library {
+        library,
+        buffer,
+        added,
+        ..
+    } = &mut *l;
+    // SAFETY: a buffer of the size the library asks for.
+    let serialized = unsafe { library.Serialize(&mut buffer[..size]) };
+    match serialized {
+        Ok(()) => {
+            *added = 0;
         }
-    };
+        Err(e) => {
+            tracing::warn!(error = %e, "host pipeline library not serialised");
+            return;
+        }
+    }
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &l.buffer[..size]))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            bytes = size,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
