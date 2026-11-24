@@ -522,7 +522,11 @@ impl Shader {
                 }
             }
         }
-        if let Some(n) = self.wave_size {
+        // kDxilWaveSize (tag 11): on NVIDIA hardware (where warp size is 32),
+        // requiring 64 causes CreateComputeShader to fail with E_INVALIDARG (0x80070057).
+        if let Some(n) = self.wave_size
+            && n <= 32
+        {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
             props.push(self.m.md_node(vec![n]));
